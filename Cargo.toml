@@ -1,0 +1,31 @@
+[package]
+name = "corvus_plugin_ai_chat"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.99"
+publish = false
+repository = "https://github.com/M-BSquared/corvus-ai-chat"
+description = "The AI Chat plugin of Corvus GCS"
+
+# Built inside a Corvus GCS checkout, at plugins/ai-chat: the crate is a
+# member of that workspace and takes its dependency versions from it.
+[dependencies]
+corvus_api = { path = "../../src/api" }
+eframe = { workspace = true }
+serde_json = { workspace = true }
+# HTTPS to a hosted model. The same rustls and certificate store the core uses
+# for its own downloads; a model on this computer or the local network is plain
+# http and does not touch them.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Published as a shared library that Settings installs, not compiled into the program.
+[package.metadata.corvus]
+loadable = true
+name = "AI Chat"
+description = "Chat with a language model of your choice, local or hosted, that can use the station through MCP"
+icon = "bot"
+version = "1.0.0"
