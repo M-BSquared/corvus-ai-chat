@@ -16,9 +16,9 @@ mod view;
 
 use std::time::Duration;
 
+use corvus_api::egui;
 use corvus_api::plugin::options::OptionSpec;
 use corvus_api::plugin::{Host, Info, Plugin};
-use corvus_api::egui;
 use serde_json::{json, Value};
 
 use agent::{Config, Event, Job, Mcp, Worker};

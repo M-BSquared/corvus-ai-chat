@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 // Under other names: the key check of the program reads the language files of the
 // application for every literal handed to `translate(`, and a plugin keeps its own.
+use corvus_api::egui::text::{LayoutJob, TextFormat};
+use corvus_api::egui::{self, Color32, CornerRadius, Galley, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use corvus_api::i18n::{tr as translate, tr_fmt as translate_fmt};
 use corvus_api::plugin::Host;
 use corvus_api::ui::button::icon_btn;
@@ -12,8 +14,6 @@ use corvus_api::ui::icons;
 use corvus_api::ui::kit::{Button, Variant};
 use corvus_api::ui::message::{self, Tone};
 use corvus_api::ui::style::{self, Weight};
-use corvus_api::egui::text::{LayoutJob, TextFormat};
-use corvus_api::egui::{self, Color32, CornerRadius, Galley, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use super::agent::Mcp;
 use super::markdown::{self, Block, Span};

@@ -404,7 +404,7 @@ async fn connect_mcp(out: &Link, cfg: &Config, cancel: &Cancel) -> Connected {
     if !cfg.use_mcp {
         return none(Mcp::Declined);
     }
-    let info = match station_get(&out.ctx, &out.server, "/api/mcp").await {
+    let info = match station_get(&out.ctx, &out.server, "/api/mcp").wait().await {
         Ok(v) => v,
         Err(e) => return none(Mcp::Failed(e)),
     };
@@ -429,9 +429,7 @@ async fn connect_mcp(out: &Link, cfg: &Config, cancel: &Cancel) -> Connected {
     };
     let hello = json!({"protocolVersion": "2025-06-18", "capabilities": {},
                        "clientInfo": {"name": "Corvus AI Chat", "version": "1"}});
-    let init = c
-        .rpc(out, "initialize", hello, cancel, Duration::from_secs(15))
-        .await;
+    let init = c.rpc(out, "initialize", hello, cancel, Duration::from_secs(15)).await;
     let instructions = match init {
         Ok(r) => r.get("instructions").and_then(Value::as_str).unwrap_or("").to_string(),
         Err(e) => return none(Mcp::Failed(e)),
@@ -465,13 +463,7 @@ struct McpClient {
 }
 
 impl McpClient {
-    async fn post(
-        &mut self,
-        out: &Link,
-        message: &Value,
-        cancel: &Cancel,
-        wait: Duration,
-    ) -> Result<Answer, String> {
+    async fn post(&mut self, out: &Link, message: &Value, cancel: &Cancel, wait: Duration) -> Result<Answer, String> {
         let auth = format!("Bearer {}", self.token);
         let mut h = vec![
             ("Content-Type", "application/json"),
@@ -525,7 +517,14 @@ impl McpClient {
         let h = [("Authorization", auth.as_str()), ("Mcp-Session-Id", session.as_str())];
         // Never cancelled: a Stop pressed during the turn must not leave the session open.
         let _ = out
-            .call("DELETE", "/mcp".into(), &h, None, &Cancel::default(), Duration::from_secs(5))
+            .call(
+                "DELETE",
+                "/mcp".into(),
+                &h,
+                None,
+                &Cancel::default(),
+                Duration::from_secs(5),
+            )
             .await;
     }
 }
