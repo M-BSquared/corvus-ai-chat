@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 
 /// How many times a model may ask for tools in one turn before the turn is
 /// ended, so a model that never stops asking cannot fly the aircraft forever.
-pub const MAX_ROUNDS: usize = 12;
+pub const MAX_ROUNDS: usize = 24;
 /// The most of one tool answer the model is given.
 pub const TOOL_TEXT_MAX: usize = 16_000;
 /// The most of one tool answer or argument list shown in the chat.
@@ -20,7 +20,19 @@ pub const ITEMS_MAX: usize = 400;
 /// dialect needs one.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-pub const DEFAULT_SYSTEM: &str = "You are the assistant built into Corvus GCS, a ground control station for PX4 and ArduPilot aircraft. You have the station's tools. Read before you act: look at the telemetry and the flight mode first. Never arm, take off, change a parameter, start a mission or move the aircraft unless the operator clearly asked for exactly that, and say in one sentence what you are about to do before you do it. If a tool is refused or needs the operator's confirmation, tell the operator instead of looking for another way. Answer briefly and plainly, in the language the operator writes in.";
+pub const DEFAULT_SYSTEM: &str = "You are the assistant built into Corvus GCS, a ground control station for PX4 and ArduPilot aircraft. You have the station's tools: use them, do not describe what could be done. Draw on the map when you talk about places, directions or routes. Read before you act: look at the telemetry and the flight mode first. Never arm, take off, change a parameter, start a mission or move the aircraft unless the operator clearly asked for exactly that, and say in one sentence what you are about to do before you do it. If a tool is refused or needs the operator's confirmation, tell the operator instead of looking for another way. Answer briefly and plainly, in the language the operator writes in.";
+
+/// The operator's instructions, then what the station tells its clients.
+pub fn system_with(own: &str, station: &str) -> String {
+    let (own, station) = (own.trim(), station.trim());
+    if station.is_empty() {
+        own.to_string()
+    } else if own.is_empty() {
+        station.to_string()
+    } else {
+        format!("{own}\n\n{station}")
+    }
+}
 
 /// The two ways of talking to a model that nearly every server and every local
 /// runtime offers one of.
@@ -232,6 +244,67 @@ pub fn tools_from_mcp(list: &Value) -> Vec<Tool> {
         });
     }
     out
+}
+
+/// The tools a small model is offered: reading, drawing and plain flying. The whole
+/// list takes about eleven thousand tokens, more than many local models are run with.
+const FEW: [&str; 24] = [
+    "get_vehicle_state",
+    "get_capabilities",
+    "list_flight_modes",
+    "download_mission",
+    "get_parameters",
+    "wait_for",
+    "measure",
+    "draw_on_map",
+    "list_drawings",
+    "remove_drawings",
+    "show_on_map",
+    "arm",
+    "disarm",
+    "takeoff",
+    "land",
+    "return_to_launch",
+    "hold",
+    "set_flight_mode",
+    "fly_to",
+    "move_by",
+    "change_altitude",
+    "set_speed",
+    "set_heading",
+    "orbit",
+];
+
+/// How many of the station's tools the model is offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offer {
+    All,
+    Few,
+}
+
+impl Offer {
+    /// The operator's choice; left to itself a model on plain http (this computer or
+    /// the local network) gets the short list and a hosted one everything.
+    pub fn from_option(v: &str, endpoint: &Endpoint) -> Offer {
+        match v {
+            "all" => Offer::All,
+            "few" => Offer::Few,
+            _ if endpoint.tls => Offer::All,
+            _ => Offer::Few,
+        }
+    }
+
+    /// `tools` as they are offered. A list with none of the short list's names in it
+    /// is offered whole.
+    pub fn of(self, tools: Vec<Tool>) -> Vec<Tool> {
+        if self == Offer::All || !tools.iter().any(|t| FEW.contains(&t.mcp_name.as_str())) {
+            return tools;
+        }
+        tools
+            .into_iter()
+            .filter(|t| FEW.contains(&t.mcp_name.as_str()))
+            .collect()
+    }
 }
 
 /// What an MCP `tools/call` answered, as text and whether it is a failure.
@@ -586,6 +659,25 @@ pub fn repair(msgs: &mut Vec<Msg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_model_gets_the_short_list_unless_told_otherwise() {
+        let local = Endpoint::parse("http://localhost:11434").unwrap();
+        let hosted = Endpoint::parse("https://api.example.com").unwrap();
+        assert_eq!(Offer::from_option("auto", &local), Offer::Few);
+        assert_eq!(Offer::from_option("", &hosted), Offer::All);
+        assert_eq!(Offer::from_option("all", &local), Offer::All);
+        assert_eq!(Offer::from_option("few", &hosted), Offer::Few);
+        let tools = |names: &[&str]| {
+            let list: Vec<Value> = names.iter().map(|n| json!({"name": n})).collect();
+            tools_from_mcp(&json!({ "tools": list }))
+        };
+        let short = Offer::Few.of(tools(&["hold", "tak_status", "draw_on_map"]));
+        let names: Vec<&str> = short.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["hold", "draw_on_map"]);
+        assert_eq!(Offer::All.of(tools(&["hold", "tak_status"])).len(), 2);
+        assert_eq!(Offer::Few.of(tools(&["other"])).len(), 1, "never nothing at all");
+    }
 
     fn ep(t: &str) -> Endpoint {
         Endpoint::parse(t).unwrap()

@@ -6,8 +6,8 @@
 //! servers that copy it), on this computer, on the local network or hosted;
 //! the address, the key and the model are set from the plugin's gear in
 //! Settings. The station's tools are not built in here: the plugin signs in to
-//! `/mcp` like any other AI client, so the operator's switches and questions in
-//! Settings, Connections, MCP apply to it unchanged ([`agent`]).
+//! `/mcp` by itself, with the token Corvus keeps for it, and the operator's
+//! switches and questions in Settings, Connections, MCP apply to it ([`agent`]).
 
 mod agent;
 mod client;
@@ -23,7 +23,7 @@ use eframe::egui;
 use serde_json::{json, Value};
 
 use agent::{Config, Event, Job, Mcp, Worker};
-use model::{clip, Call, Endpoint, Msg, Provider, DEFAULT_SYSTEM, ITEMS_MAX, TOOL_TEXT_MAX};
+use model::{clip, Call, Endpoint, Msg, Offer, Provider, DEFAULT_SYSTEM, ITEMS_MAX, TOOL_TEXT_MAX};
 
 /// One line of the chat.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +62,7 @@ const OPT_KEY: &str = "key";
 const OPT_MODEL: &str = "model";
 const OPT_SYSTEM: &str = "system";
 const OPT_MCP: &str = "mcp";
+const OPT_OFFER: &str = "offer";
 const OPT_TOKENS: &str = "tokens";
 const OPT_WAIT: &str = "wait";
 
@@ -100,8 +101,19 @@ impl Plugin for AiChat {
                 "Leave empty for a server that needs none. It is saved in this plugin's settings on this computer, so leave it out of an exported settings file you share.",
             ),
             OptionSpec::toggle(OPT_MCP, "Use the station's tools", true).hint(
-                "Lets the model read the aircraft and use the tools Settings, Connections, MCP allows. Switch the server on there; what changes the aircraft stays off until you allow it, and asks you first unless you said otherwise.",
+                "Lets the model read the aircraft, draw on the map and steer. Nothing has to be switched on for it. Corvus asks you before anything that changes the aircraft, unless you allowed it under Settings, Connections, MCP.",
             ),
+            OptionSpec::select(
+                OPT_OFFER,
+                "Number of tools",
+                &[
+                    ("auto", "By itself: few for a local model"),
+                    ("few", "Few: read, draw and fly"),
+                    ("all", "All of them"),
+                ],
+                "auto",
+            )
+            .hint("All the tools take about 11000 tokens of the model's context and a capable model. A local model needs a context of 8000 tokens or more even for the few (num_ctx in Ollama)."),
             OptionSpec::text(OPT_SYSTEM, "Instructions", DEFAULT_SYSTEM)
                 .hint("What the model is told before every conversation."),
             OptionSpec::number(
@@ -188,7 +200,9 @@ impl AiChat {
                 s
             }
         };
+        let offer = Offer::from_option(&text(OPT_OFFER), &endpoint);
         Ok(Config {
+            offer,
             provider: Provider::from_option(&text(OPT_PROVIDER)),
             endpoint,
             key: text(OPT_KEY),
@@ -348,10 +362,14 @@ impl AiChat {
         self.unfolded.clear();
     }
 
-    /// Switches the station's MCP server on, from the button next to its status.
+    /// Switches the station's tools on, from the button next to their status.
     pub fn switch_mcp_on(&mut self, h: &mut Host) {
         if self.switching.is_none() {
-            self.switching = Some(h.post("/api/mcp/settings", json!({"enabled": true})));
+            let patch = match self.mcp {
+                Some(Mcp::Off { own: false }) => json!({"enabled": true}),
+                _ => json!({"assistant": true}),
+            };
+            self.switching = Some(h.post("/api/mcp/settings", patch));
         }
     }
 
@@ -408,7 +426,7 @@ mod tests {
     #[test]
     fn the_options_are_all_usable() {
         let specs = corvus_api::plugin::options::clean(AiChat::default().options());
-        assert_eq!(specs.len(), 8);
+        assert_eq!(specs.len(), 9);
         assert!(specs.iter().find(|s| s.key == OPT_KEY).is_some_and(|s| s.secret));
     }
 

@@ -21,15 +21,21 @@ MCP server, the same ones an AI client like Claude Desktop gets.
 
 ## The station's tools, and who decides
 
-The plugin is an ordinary MCP client of the Corvus it sits in. It signs in to
-`/mcp` with the token of `GET /api/mcp` (this computer only), so it gets exactly
-the tools the operator's switches in Settings, Connections, MCP allow, and the
-same question before anything that changes the aircraft. It never talks to the
-vehicle by another road. The MCP server is off by default; the chat says so and
-has a button that switches it on. What changes the aircraft stays off there
-until you allow it.
+The plugin is an MCP client of the Corvus it sits in and signs in by itself.
+Corvus keeps a token for it (`assistant` of `GET /api/mcp`, this computer only,
+new at every start), so nothing has to be switched on, and the MCP server for
+other programs can stay off. The model reads the aircraft, draws on the map,
+plans and flies. The operator's switches in Settings, Connections, MCP decide:
+what is allowed there runs, what is off is asked for in the window each time.
+The plugin never talks to the vehicle by another road. On a Corvus that keeps
+no such token it signs in like any other client, and a button switches the
+server on.
 
-A model that keeps asking for tools is ended after 12 rounds in one turn.
+All the station's tools are about 11000 tokens. A model on plain http (this
+computer or the local network) is offered the 24 that read, draw and fly unless
+the gear says otherwise; a hosted one gets all of them.
+
+A model that keeps asking for tools is ended after 24 rounds in one turn.
 
 ## What it is
 

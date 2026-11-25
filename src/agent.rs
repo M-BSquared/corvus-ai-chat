@@ -1,11 +1,13 @@
 //! The work of one turn, on a thread of its own: ask the model, run the tools it
 //! asks for through Corvus' MCP server, ask again, until it has said its piece.
 //!
-//! The plugin is an ordinary MCP client of the station it sits in. It signs in
-//! with the token of `GET /api/mcp` (this computer only) and so gets exactly
-//! the tools the operator's switches in Settings, Connections, MCP allow, with
-//! the same questions before a risky act. Nothing here reaches the vehicle by
-//! another road.
+//! The plugin is an ordinary MCP client of the station it sits in. Corvus keeps
+//! a token for it (`assistant` of `GET /api/mcp`, this computer only), so it
+//! signs in by itself, also while the server for other programs is off. What it
+//! may do is the operator's to say in Settings, Connections, MCP: a tool that is
+//! off there is asked for in the window. Nothing here reaches the vehicle by
+//! another road. A Corvus without that token is signed in to as any other client
+//! does, with its server switched on.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
@@ -18,7 +20,7 @@ use serde_json::{json, Value};
 use super::client::{self, Cancel};
 use super::model::{
     self, anthropic_body, error_text, model_ids, openai_body, parse_anthropic, parse_openai, repair, tool_text, window,
-    Call, Endpoint, Msg, Provider, Tool, HISTORY_CHARS, MAX_ROUNDS, TOOL_TEXT_MAX,
+    Call, Endpoint, Msg, Offer, Provider, Tool, HISTORY_CHARS, MAX_ROUNDS, TOOL_TEXT_MAX,
 };
 
 /// How the plugin stands with the station's MCP server.
@@ -28,8 +30,9 @@ pub enum Mcp {
     Unknown,
     /// The operator switched it off in the plugin's gear.
     Declined,
-    /// The server is off in Settings, Connections, MCP.
-    Off,
+    /// Off in Settings, Connections, MCP: AI Chat's own switch, or on a Corvus
+    /// that has none the server itself.
+    Off { own: bool },
     /// Signed in, with this many tools on offer.
     Ready(usize),
     /// Could not be reached, and why.
@@ -68,6 +71,7 @@ pub struct Config {
     pub model: String,
     pub system: String,
     pub use_mcp: bool,
+    pub offer: Offer,
     pub max_tokens: u32,
     pub wait: Duration,
 }
@@ -240,6 +244,10 @@ fn turn(out: &Out, server: &Server, cfg: &Config, mut history: Vec<Msg>, cancel:
     let mut mcp = connect_mcp(server, cfg, cancel);
     out.send(Event::Mcp(mcp.state()));
     let tools = mcp.tools.clone();
+    let cfg = &Config {
+        system: model::system_with(&cfg.system, &mcp.instructions),
+        ..cfg.clone()
+    };
     let result = rounds(out, cfg, &mut history, &mut mcp, &tools, cancel);
     if let Some(m) = mcp.client.take() {
         m.close(cancel);
@@ -327,6 +335,8 @@ fn run_tool(mcp: &mut Connected, tools: &[Tool], call: &Call, cancel: &Cancel) -
 struct Connected {
     client: Option<McpClient>,
     tools: Vec<Tool>,
+    /// What the server tells its clients about itself.
+    instructions: String,
     failure: Option<Mcp>,
 }
 
@@ -344,6 +354,7 @@ fn connect_mcp(server: &Server, cfg: &Config, cancel: &Cancel) -> Connected {
     let none = |failure: Mcp| Connected {
         client: None,
         tools: Vec::new(),
+        instructions: String::new(),
         failure: Some(failure),
     };
     if !cfg.use_mcp {
@@ -353,10 +364,15 @@ fn connect_mcp(server: &Server, cfg: &Config, cancel: &Cancel) -> Connected {
         Ok(v) => v,
         Err(e) => return none(Mcp::Failed(e)),
     };
-    if info.pointer("/settings/enabled") != Some(&Value::Bool(true)) {
-        return none(Mcp::Off);
+    let own = info.get("assistant").filter(|a| a.is_object());
+    let on = match own {
+        Some(a) => a.get("on") == Some(&Value::Bool(true)),
+        None => info.pointer("/settings/enabled") == Some(&Value::Bool(true)),
+    };
+    if !on {
+        return none(Mcp::Off { own: own.is_some() });
     }
-    let token = info.get("token").and_then(Value::as_str).unwrap_or("");
+    let token = own.unwrap_or(&info).get("token").and_then(Value::as_str).unwrap_or("");
     if token.is_empty() {
         return none(Mcp::Failed(
             "The tools are only reachable on the computer Corvus GCS runs on.".into(),
@@ -381,16 +397,18 @@ fn connect_mcp(server: &Server, cfg: &Config, cancel: &Cancel) -> Connected {
         cancel,
         Duration::from_secs(15),
     );
-    if let Err(e) = init {
-        return none(Mcp::Failed(e));
-    }
+    let instructions = match init {
+        Ok(r) => r.get("instructions").and_then(Value::as_str).unwrap_or("").to_string(),
+        Err(e) => return none(Mcp::Failed(e)),
+    };
     let _ = c.notify("notifications/initialized", cancel);
     match c.rpc("tools/list", json!({}), cancel, Duration::from_secs(15)) {
         Ok(list) => {
-            let tools = model::tools_from_mcp(&list);
+            let tools = cfg.offer.of(model::tools_from_mcp(&list));
             Connected {
                 client: Some(c),
                 tools,
+                instructions,
                 failure: None,
             }
         }
@@ -543,6 +561,7 @@ mod tests {
             model: "m".into(),
             system: "s".into(),
             use_mcp: true,
+            offer: Offer::All,
             max_tokens: 0,
             wait: Duration::from_secs(10),
         }
@@ -658,10 +677,79 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::Note(n) if n.contains("rounds"))));
-        assert!(events.iter().any(|e| matches!(e, Event::Mcp(Mcp::Off))));
+        assert!(events.iter().any(|e| matches!(e, Event::Mcp(Mcp::Off { own: false }))));
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ToolDone { error: true, text, .. } if text.contains("no tool"))));
+    }
+
+    #[test]
+    fn the_chat_signs_in_with_its_own_token_while_the_server_is_off() {
+        let (port, seen) =
+            stub(|method, path, body| {
+                match (method, path) {
+            ("GET", "/api/mcp") => (
+                200,
+                json!({"settings": {"enabled": false}, "token": "theirs", "assistant": {"on": true, "token": "mine"}})
+                    .to_string(),
+                vec![],
+            ),
+            ("POST", "/mcp") => {
+                let id = body.get("id").cloned().unwrap_or(Value::Null);
+                let result = match body.get("method").and_then(Value::as_str) {
+                    Some("initialize") => json!({"instructions": "Draw on the map."}),
+                    Some("tools/list") => json!({"tools": [{"name": "draw_on_map"}]}),
+                    _ => return (202, String::new(), vec![]),
+                };
+                (200, json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(), vec![])
+            }
+            ("POST", "/v1/chat/completions") => (
+                200,
+                json!({"choices": [{"message": {"content": "Done."}}]}).to_string(),
+                vec![],
+            ),
+            _ => (200, String::new(), vec![]),
+        }
+            });
+        let events = run_turn(port, Provider::OpenAi, vec![Msg::User("x".into())]);
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Mcp(Mcp::Ready(1)))),
+            "{events:?}"
+        );
+        let seen = seen.lock().unwrap();
+        let asked = seen.iter().find(|s| s.contains("/v1/chat/completions")).unwrap();
+        assert!(
+            asked.contains("Draw on the map."),
+            "the model is told what the station says: {asked}"
+        );
+        assert!(asked.contains("draw_on_map"), "{asked}");
+        drop(seen);
+
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let h = heads.clone();
+        let (port, _) = stub(move |method, path, _| {
+            h.lock().unwrap().push(format!("{method} {path}"));
+            match (method, path) {
+                ("GET", "/api/mcp") => (
+                    200,
+                    json!({"settings": {"enabled": true}, "token": "theirs", "assistant": {"on": false, "token": "mine"}})
+                        .to_string(),
+                    vec![],
+                ),
+                ("POST", "/v1/chat/completions") => (
+                    200,
+                    json!({"choices": [{"message": {"content": "Done."}}]}).to_string(),
+                    vec![],
+                ),
+                _ => (200, String::new(), vec![]),
+            }
+        });
+        let events = run_turn(port, Provider::OpenAi, vec![Msg::User("x".into())]);
+        assert!(events.iter().any(|e| matches!(e, Event::Mcp(Mcp::Off { own: true }))));
+        assert!(
+            !heads.lock().unwrap().iter().any(|h| h == "POST /mcp"),
+            "its own switch is off: it does not come in by the other door"
+        );
     }
 
     #[test]

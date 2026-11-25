@@ -34,10 +34,11 @@ const ROWS: usize = 6;
 const SEND: f32 = 34.0;
 
 /// What an empty chat offers to ask.
-const QUESTIONS: [(&str, &str); 3] = [
+const QUESTIONS: [(&str, &str); 4] = [
     ("plane-takeoff", "Is the aircraft ready to fly?"),
     ("battery-medium", "How are the battery and the GPS?"),
     ("triangle-alert", "Explain the last warnings."),
+    ("map-pin", "Draw the way from the aircraft back home on the map."),
 ];
 
 pub fn show(p: &mut AiChat, ui: &mut egui::Ui, area: Rect, h: &mut Host) -> f32 {
@@ -145,7 +146,7 @@ fn header(p: &mut AiChat, ui: &mut egui::Ui, x: f32, y: f32, w: f32, h: &mut Hos
             translate_fmt("{n} station tools", &[("n", &n.to_string())]),
         ),
         Some(Mcp::Declined) => (style::text_3(), translate("without the station's tools").into_owned()),
-        Some(Mcp::Off) => (style::warning(), translate("MCP server is off").into_owned()),
+        Some(Mcp::Off { .. }) => (style::warning(), translate("the station's tools are off").into_owned()),
         Some(Mcp::Failed(_)) => (style::critical(), translate("station tools failed").into_owned()),
         Some(Mcp::Unknown) | None if ready => (
             style::text_3(),
@@ -197,7 +198,7 @@ fn header(p: &mut AiChat, ui: &mut egui::Ui, x: f32, y: f32, w: f32, h: &mut Hos
     bottom += 1.0;
     match &p.mcp {
         Some(Mcp::Failed(e)) => bottom = message::show(ui, x, bottom + 6.0, w, &clip(e, 200), Tone::Err),
-        Some(Mcp::Off) => bottom = mcp_off(p, ui, x, bottom + 8.0, w, h),
+        Some(Mcp::Off { .. }) => bottom = mcp_off(p, ui, x, bottom + 8.0, w, h),
         _ => {}
     }
     bottom
@@ -207,9 +208,9 @@ fn header(p: &mut AiChat, ui: &mut egui::Ui, x: f32, y: f32, w: f32, h: &mut Hos
 fn mcp_off(p: &mut AiChat, ui: &mut egui::Ui, x: f32, y: f32, w: f32, h: &mut Host) -> f32 {
     let b = Button::new("Switch on", Variant::Secondary)
         .small()
-        .title("Switches the MCP server on in Settings, Connections, MCP. What changes the aircraft stays off there until you allow it.");
+        .title("Lets AI Chat use the station's tools. Corvus asks you before anything that changes the aircraft.");
     let (bw, bh) = (b.width(ui), b.height());
-    let say = translate("The station's MCP server is off, so the model cannot see or steer the aircraft");
+    let say = translate("The station's tools are off for AI Chat, so the model cannot see or steer the aircraft");
     let g = wrap(ui, &say, 11.5, Weight::W400, style::text_2(), w - bw - 34.0, 0);
     let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, g.size().y.max(bh) + 14.0));
     ui.painter().rect_filled(rect, 10, style::surface_2());
@@ -271,7 +272,7 @@ fn welcome(
 ) -> f32 {
     let inner = (w - 24.0).min(420.0);
     let left = x + (w - inner) / 2.0;
-    let mut y = top + ((room - 330.0) / 2.0).max(18.0);
+    let mut y = top + ((room - 376.0) / 2.0).max(18.0);
     avatar(ui, Pos2::new(x + w / 2.0, y + 32.0), 64.0);
     y += 64.0 + 14.0;
     let center = |ui: &egui::Ui, g: Arc<Galley>, y: f32, ink: Color32| -> f32 {
@@ -286,7 +287,7 @@ fn welcome(
     let g = wrap(ui, &head, 16.0, Weight::W600, style::text_1(), inner, 0);
     y = center(ui, g, y, style::text_1()) + 8.0;
     let text = match setup {
-        Ok(()) => translate("Ask about the aircraft, the mission or the setup. The model uses the station's tools when they are switched on in Settings, Connections, MCP, and you are asked before anything that changes the aircraft."),
+        Ok(()) => translate("Ask about the aircraft, the mission or the setup, or have something drawn on the map or flown. The model uses the station's tools by itself, and you are asked before anything that changes the aircraft."),
         Err(_) => translate("Open the gear of AI Chat in Settings, Plugins, and enter where the model is and its name. A model on this computer is enough."),
     };
     let mut job = LayoutJob::default();
@@ -791,7 +792,7 @@ mod tests {
             for opts in [set_up(), Map::new()] {
                 for mut p in [AiChat::default(), chat()] {
                     for busy in [false, true] {
-                        for mcp in [Mcp::Off, Mcp::Ready(8), Mcp::Failed("no".into())] {
+                        for mcp in [Mcp::Off { own: true }, Mcp::Ready(8), Mcp::Failed("no".into())] {
                             p.busy = busy;
                             p.follow = true;
                             p.mcp = Some(mcp);
