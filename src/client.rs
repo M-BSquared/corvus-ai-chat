@@ -185,10 +185,8 @@ pub fn call(
         head.push_str(&format!("Content-Length: {}\r\n", b.len()));
     }
     head.push_str("\r\n");
+    head.push_str(body.unwrap_or(""));
     stream.write_all(head.as_bytes()).map_err(fail)?;
-    if let Some(b) = body {
-        stream.write_all(b.as_bytes()).map_err(fail)?;
-    }
     stream.flush().map_err(fail)?;
     let response = read_response(BufReader::new(stream)).map_err(fail)?;
     let (status, headers) = (response.status, response.headers.clone());
@@ -201,13 +199,33 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    fn whole(request: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(request);
+        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+            return false;
+        };
+        let want = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: ")?.parse().ok())
+            .unwrap_or(0);
+        body.len() >= want
+    }
+
     fn serve(reply: &'static [u8], hold: Duration) -> Endpoint {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((mut s, _)) = listener.accept() {
+                // The whole request: closing on unread bytes resets the connection, and
+                // on Windows the client then loses the answer.
+                let mut got = Vec::new();
                 let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
+                while !whole(&got) {
+                    match s.read(&mut buf) {
+                        Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                        _ => return,
+                    }
+                }
                 std::thread::sleep(hold);
                 let _ = s.write_all(reply);
             }
