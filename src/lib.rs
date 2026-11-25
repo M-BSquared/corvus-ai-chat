@@ -10,7 +10,6 @@
 //! switches and questions in Settings, Connections, MCP apply to it ([`agent`]).
 
 mod agent;
-mod client;
 pub mod markdown;
 pub mod model;
 mod view;
@@ -19,7 +18,7 @@ use std::time::Duration;
 
 use corvus_api::plugin::options::OptionSpec;
 use corvus_api::plugin::{Host, Info, Plugin};
-use eframe::egui;
+use corvus_api::egui;
 use serde_json::{json, Value};
 
 use agent::{Config, Event, Job, Mcp, Worker};
@@ -74,7 +73,7 @@ impl Plugin for AiChat {
             icon: "bot",
             description:
                 "Chat with a language model of your choice, local or hosted, that can use the station through MCP",
-            version: "1.1.0",
+            version: "2.0.0",
             order: 20,
             can_tab: true,
         }
@@ -148,10 +147,14 @@ impl Plugin for AiChat {
     }
 
     fn tick(&mut self, h: &mut Host) {
-        self.retired.retain(|w| !w.done());
-        if let Some(w) = &self.worker {
-            let done = w.done();
+        // A turn that was cleared away still signs out.
+        self.retired.retain_mut(|w| {
+            w.poll();
+            !w.done()
+        });
+        if let Some(w) = &mut self.worker {
             let events = w.poll();
+            let done = w.done();
             let finished = events.iter().any(|e| matches!(e, Event::Finished));
             for e in events {
                 self.apply(e);

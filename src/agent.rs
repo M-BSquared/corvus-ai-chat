@@ -1,4 +1,4 @@
-//! The work of one turn, on a thread of its own: ask the model, run the tools it
+//! The work of one turn, as a task the plugin moves along on every tick: ask the model, run the tools it
 //! asks for through Corvus' MCP server, ask again, until it has said its piece.
 //!
 //! The plugin is an ordinary MCP client of the station it sits in. Corvus keeps
@@ -9,15 +9,20 @@
 //! another road. A Corvus without that token is signed in to as any other client
 //! does, with its server switched on.
 
+use std::future::poll_fn;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::thread::JoinHandle;
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
-use corvus_api::net::http::{self, Server};
-use eframe::egui;
+use corvus_api::egui;
+use corvus_api::net::fetch::{self, Answer};
+use corvus_api::net::http::Server;
+use corvus_api::net::station_get;
+use corvus_api::task::Task;
 use serde_json::{json, Value};
 
-use super::client::{self, Cancel};
 use super::model::{
     self, anthropic_body, error_text, model_ids, openai_body, parse_anthropic, parse_openai, repair, tool_text, window,
     Call, Endpoint, Msg, Offer, Provider, Tool, HISTORY_CHARS, MAX_ROUNDS, TOOL_TEXT_MAX,
@@ -83,27 +88,40 @@ pub enum Job {
     Check { models: bool },
 }
 
-/// A turn or a check under way. Dropping it stops it and waits for the thread.
+/// Whether the work in progress should end. Shared by every request of a turn.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// A turn or a check under way. Dropping it gives up whatever it waits for.
 pub struct Worker {
     rx: Receiver<Event>,
     cancel: Cancel,
-    handle: Option<JoinHandle<()>>,
+    task: Task,
 }
 
 impl Worker {
     pub fn spawn(ctx: &egui::Context, server: Server, cfg: Config, job: Job) -> Worker {
         let (tx, rx) = channel();
         let cancel = Cancel::default();
-        let (c, ctx) = (cancel.clone(), ctx.clone());
-        let handle = std::thread::Builder::new()
-            .name("ai-chat".into())
-            .spawn(move || {
-                let out = Out { tx, ctx };
-                run(&out, &server, &cfg, job, &c);
-                out.send(Event::Finished);
-            })
-            .ok();
-        Worker { rx, cancel, handle }
+        let (stop, ctx) = (cancel.clone(), ctx.clone());
+        let task = Task::new(async move {
+            let link = Link { ctx, server, tx };
+            run(&link, &cfg, job, &stop).await;
+            link.send(Event::Finished);
+        });
+        let mut worker = Worker { rx, cancel, task };
+        worker.task.poll();
+        worker
     }
 
     /// Asks the work to end; it does so within a moment.
@@ -111,55 +129,86 @@ impl Worker {
         self.cancel.cancel();
     }
 
-    /// What has arrived since the last call.
-    pub fn poll(&self) -> Vec<Event> {
+    /// Moves the work along and answers with what has happened since the last call.
+    pub fn poll(&mut self) -> Vec<Event> {
+        self.task.poll();
         self.rx.try_iter().collect()
     }
 
-    /// Whether the thread has ended and everything it said was taken.
+    /// Whether the work has ended.
     pub fn done(&self) -> bool {
-        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+        self.task.done()
     }
 }
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-struct Out {
-    tx: Sender<Event>,
+/// What the work talks through: the station it sits in and the window.
+struct Link {
     ctx: egui::Context,
+    server: Server,
+    tx: Sender<Event>,
 }
 
-impl Out {
+impl Link {
     fn send(&self, e: Event) {
         let _ = self.tx.send(e);
         self.ctx.request_repaint();
     }
+
+    /// Sends one request to `url` and reads the whole answer, which is `wait` at most. `cancel`
+    /// ends it within a moment.
+    async fn call(
+        &self,
+        method: &str,
+        url: String,
+        headers: &[(&str, &str)],
+        body: Option<String>,
+        cancel: &Cancel,
+        wait: Duration,
+    ) -> Result<Answer, String> {
+        if cancel.is_set() {
+            return Err("Stopped.".into());
+        }
+        let request = fetch::Request {
+            method: method.into(),
+            url,
+            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body,
+            wait,
+        };
+        let mut under_way = fetch::start(&self.ctx, &self.server, request);
+        poll_fn(move |_| {
+            if cancel.is_set() {
+                return Poll::Ready(Err("Stopped.".to_string()));
+            }
+            under_way.take().map_or(Poll::Pending, Poll::Ready)
+        })
+        .await
+    }
 }
 
-fn run(out: &Out, server: &Server, cfg: &Config, job: Job, cancel: &Cancel) {
+/// The whole address of `path` at the model server.
+fn address(ep: &Endpoint, path: &str) -> String {
+    let scheme = if ep.tls { "https" } else { "http" };
+    format!("{scheme}://{}{path}", ep.host_header())
+}
+
+async fn run(out: &Link, cfg: &Config, job: Job, cancel: &Cancel) {
     match job {
         Job::Check { models } => {
-            let mcp = connect_mcp(server, cfg, cancel);
+            let mcp = connect_mcp(out, cfg, cancel).await;
             out.send(Event::Mcp(mcp.state()));
             if let Some(m) = mcp.client {
-                m.close(cancel);
+                m.close(out).await;
             }
             if models && !cancel.is_set() {
-                match list_models(cfg, cancel) {
+                match list_models(out, cfg, cancel).await {
                     Ok(ids) => out.send(Event::Models(ids)),
                     Err(e) => out.send(Event::Failed(e)),
                 }
             }
         }
         Job::Turn { history } => {
-            if let Err(e) = turn(out, server, cfg, history, cancel) {
+            if let Err(e) = turn(out, cfg, history, cancel).await {
                 if !cancel.is_set() {
                     out.send(Event::Failed(e));
                 }
@@ -192,17 +241,12 @@ fn as_refs(h: &[(String, String)]) -> Vec<(&str, &str)> {
     h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
 }
 
-fn list_models(cfg: &Config, cancel: &Cancel) -> Result<Vec<String>, String> {
+async fn list_models(out: &Link, cfg: &Config, cancel: &Cancel) -> Result<Vec<String>, String> {
     let h = headers(cfg);
-    let a = client::call(
-        &cfg.endpoint,
-        "GET",
-        &cfg.endpoint.models_path(),
-        &as_refs(&h),
-        None,
-        cancel,
-        Duration::from_secs(20),
-    )?;
+    let url = address(&cfg.endpoint, &cfg.endpoint.models_path());
+    let a = out
+        .call("GET", url, &as_refs(&h), None, cancel, Duration::from_secs(20))
+        .await?;
     if a.status != 200 {
         return Err(error_text(a.status, &a.body));
     }
@@ -210,7 +254,13 @@ fn list_models(cfg: &Config, cancel: &Cancel) -> Result<Vec<String>, String> {
     Ok(model_ids(&v))
 }
 
-fn ask_model(cfg: &Config, msgs: &[Msg], tools: &[Tool], cancel: &Cancel) -> Result<model::Reply, String> {
+async fn ask_model(
+    out: &Link,
+    cfg: &Config,
+    msgs: &[Msg],
+    tools: &[Tool],
+    cancel: &Cancel,
+) -> Result<model::Reply, String> {
     type Parse = fn(&Value) -> Result<model::Reply, String>;
     let (body, parse): (Value, Parse) = match cfg.provider {
         Provider::OpenAi => (
@@ -223,15 +273,10 @@ fn ask_model(cfg: &Config, msgs: &[Msg], tools: &[Tool], cancel: &Cancel) -> Res
         ),
     };
     let h = headers(cfg);
-    let a = client::call(
-        &cfg.endpoint,
-        "POST",
-        &cfg.endpoint.chat_path(cfg.provider),
-        &as_refs(&h),
-        Some(&body.to_string()),
-        cancel,
-        cfg.wait,
-    )?;
+    let url = address(&cfg.endpoint, &cfg.endpoint.chat_path(cfg.provider));
+    let a = out
+        .call("POST", url, &as_refs(&h), Some(body.to_string()), cancel, cfg.wait)
+        .await?;
     if a.status != 200 {
         return Err(error_text(a.status, &a.body));
     }
@@ -239,24 +284,24 @@ fn ask_model(cfg: &Config, msgs: &[Msg], tools: &[Tool], cancel: &Cancel) -> Res
     parse(&v)
 }
 
-fn turn(out: &Out, server: &Server, cfg: &Config, mut history: Vec<Msg>, cancel: &Cancel) -> Result<(), String> {
+async fn turn(out: &Link, cfg: &Config, mut history: Vec<Msg>, cancel: &Cancel) -> Result<(), String> {
     repair(&mut history);
-    let mut mcp = connect_mcp(server, cfg, cancel);
+    let mut mcp = connect_mcp(out, cfg, cancel).await;
     out.send(Event::Mcp(mcp.state()));
     let tools = mcp.tools.clone();
     let cfg = &Config {
         system: model::system_with(&cfg.system, &mcp.instructions),
         ..cfg.clone()
     };
-    let result = rounds(out, cfg, &mut history, &mut mcp, &tools, cancel);
+    let result = rounds(out, cfg, &mut history, &mut mcp, &tools, cancel).await;
     if let Some(m) = mcp.client.take() {
-        m.close(cancel);
+        m.close(out).await;
     }
     result
 }
 
-fn rounds(
-    out: &Out,
+async fn rounds(
+    out: &Link,
     cfg: &Config,
     history: &mut Vec<Msg>,
     mcp: &mut Connected,
@@ -267,7 +312,7 @@ fn rounds(
         if cancel.is_set() {
             return Ok(());
         }
-        let reply = ask_model(cfg, window(history, HISTORY_CHARS), tools, cancel)?;
+        let reply = ask_model(out, cfg, window(history, HISTORY_CHARS), tools, cancel).await?;
         history.push(Msg::Assistant {
             text: reply.text.clone(),
             calls: reply.calls.clone(),
@@ -285,7 +330,7 @@ fn rounds(
             let (text, error) = if cancel.is_set() {
                 ("The call did not run: the turn was stopped.".to_string(), true)
             } else {
-                run_tool(mcp, tools, &call, cancel)
+                run_tool(out, mcp, tools, &call, cancel).await
             };
             let sent = model::clip(&text, TOOL_TEXT_MAX);
             out.send(Event::ToolDone {
@@ -308,7 +353,7 @@ fn rounds(
     Ok(())
 }
 
-fn run_tool(mcp: &mut Connected, tools: &[Tool], call: &Call, cancel: &Cancel) -> (String, bool) {
+async fn run_tool(out: &Link, mcp: &mut Connected, tools: &[Tool], call: &Call, cancel: &Cancel) -> (String, bool) {
     let Some(tool) = tools.iter().find(|t| t.name == call.name) else {
         return (format!("There is no tool called {}.", call.name), true);
     };
@@ -320,12 +365,11 @@ fn run_tool(mcp: &mut Connected, tools: &[Tool], call: &Call, cancel: &Cancel) -
     } else {
         json!({})
     };
-    match client.rpc(
-        "tools/call",
-        json!({"name": tool.mcp_name, "arguments": args}),
-        cancel,
-        Duration::from_secs(120),
-    ) {
+    let params = json!({"name": tool.mcp_name, "arguments": args});
+    match client
+        .rpc(out, "tools/call", params, cancel, Duration::from_secs(120))
+        .await
+    {
         Ok(r) => tool_text(&r),
         Err(e) => (e, true),
     }
@@ -350,7 +394,7 @@ impl Connected {
     }
 }
 
-fn connect_mcp(server: &Server, cfg: &Config, cancel: &Cancel) -> Connected {
+async fn connect_mcp(out: &Link, cfg: &Config, cancel: &Cancel) -> Connected {
     let none = |failure: Mcp| Connected {
         client: None,
         tools: Vec::new(),
@@ -360,7 +404,7 @@ fn connect_mcp(server: &Server, cfg: &Config, cancel: &Cancel) -> Connected {
     if !cfg.use_mcp {
         return none(Mcp::Declined);
     }
-    let info = match http::get_json(server, "/api/mcp") {
+    let info = match station_get(&out.ctx, &out.server, "/api/mcp").await {
         Ok(v) => v,
         Err(e) => return none(Mcp::Failed(e)),
     };
@@ -378,31 +422,25 @@ fn connect_mcp(server: &Server, cfg: &Config, cancel: &Cancel) -> Connected {
             "The tools are only reachable on the computer Corvus GCS runs on.".into(),
         ));
     }
-    let ep = Endpoint {
-        tls: false,
-        host: server.host.trim_start_matches('[').trim_end_matches(']').to_string(),
-        port: server.port,
-        base: String::new(),
-    };
     let mut c = McpClient {
-        ep,
         token: token.to_string(),
         session: None,
         id: 0,
     };
-    let init = c.rpc(
-        "initialize",
-        json!({"protocolVersion": "2025-06-18", "capabilities": {},
-               "clientInfo": {"name": "Corvus AI Chat", "version": "1"}}),
-        cancel,
-        Duration::from_secs(15),
-    );
+    let hello = json!({"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "Corvus AI Chat", "version": "1"}});
+    let init = c
+        .rpc(out, "initialize", hello, cancel, Duration::from_secs(15))
+        .await;
     let instructions = match init {
         Ok(r) => r.get("instructions").and_then(Value::as_str).unwrap_or("").to_string(),
         Err(e) => return none(Mcp::Failed(e)),
     };
-    let _ = c.notify("notifications/initialized", cancel);
-    match c.rpc("tools/list", json!({}), cancel, Duration::from_secs(15)) {
+    let _ = c.notify(out, "notifications/initialized", cancel).await;
+    match c
+        .rpc(out, "tools/list", json!({}), cancel, Duration::from_secs(15))
+        .await
+    {
         Ok(list) => {
             let tools = cfg.offer.of(model::tools_from_mcp(&list));
             Connected {
@@ -413,7 +451,7 @@ fn connect_mcp(server: &Server, cfg: &Config, cancel: &Cancel) -> Connected {
             }
         }
         Err(e) => {
-            c.close(cancel);
+            c.close(out).await;
             none(Mcp::Failed(e))
         }
     }
@@ -421,14 +459,19 @@ fn connect_mcp(server: &Server, cfg: &Config, cancel: &Cancel) -> Connected {
 
 /// A client of `POST /mcp`, one request after the other.
 struct McpClient {
-    ep: Endpoint,
     token: String,
     session: Option<String>,
     id: u64,
 }
 
 impl McpClient {
-    fn post(&mut self, message: &Value, cancel: &Cancel, wait: Duration) -> Result<client::Answer, String> {
+    async fn post(
+        &mut self,
+        out: &Link,
+        message: &Value,
+        cancel: &Cancel,
+        wait: Duration,
+    ) -> Result<Answer, String> {
         let auth = format!("Bearer {}", self.token);
         let mut h = vec![
             ("Content-Type", "application/json"),
@@ -438,20 +481,26 @@ impl McpClient {
         if let Some(s) = &self.session {
             h.push(("Mcp-Session-Id", s.as_str()));
         }
-        let a = client::call(&self.ep, "POST", "/mcp", &h, Some(&message.to_string()), cancel, wait)?;
+        let a = out
+            .call("POST", "/mcp".into(), &h, Some(message.to_string()), cancel, wait)
+            .await?;
         if let Some(s) = a.header("mcp-session-id") {
             self.session = Some(s.to_string());
         }
         Ok(a)
     }
 
-    fn rpc(&mut self, method: &str, params: Value, cancel: &Cancel, wait: Duration) -> Result<Value, String> {
+    async fn rpc(
+        &mut self,
+        out: &Link,
+        method: &str,
+        params: Value,
+        cancel: &Cancel,
+        wait: Duration,
+    ) -> Result<Value, String> {
         self.id += 1;
-        let a = self.post(
-            &json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params}),
-            cancel,
-            wait,
-        )?;
+        let message = json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params});
+        let a = self.post(out, &message, cancel, wait).await?;
         let v: Value = serde_json::from_str(&a.body).unwrap_or(Value::Null);
         if let Some(why) = v.pointer("/error/message").and_then(Value::as_str) {
             return Err(why.to_string());
@@ -462,30 +511,22 @@ impl McpClient {
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    fn notify(&mut self, method: &str, cancel: &Cancel) -> Result<(), String> {
-        self.post(
-            &json!({"jsonrpc": "2.0", "method": method}),
-            cancel,
-            Duration::from_secs(5),
-        )
-        .map(|_| ())
+    async fn notify(&mut self, out: &Link, method: &str, cancel: &Cancel) -> Result<(), String> {
+        let message = json!({"jsonrpc": "2.0", "method": method});
+        self.post(out, &message, cancel, Duration::from_secs(5))
+            .await
+            .map(|_| ())
     }
 
     /// Says goodbye, so the station's list of clients does not fill up.
-    fn close(self, _cancel: &Cancel) {
+    async fn close(self, out: &Link) {
         let Some(session) = &self.session else { return };
         let auth = format!("Bearer {}", self.token);
         let h = [("Authorization", auth.as_str()), ("Mcp-Session-Id", session.as_str())];
         // Never cancelled: a Stop pressed during the turn must not leave the session open.
-        let _ = client::call(
-            &self.ep,
-            "DELETE",
-            "/mcp",
-            &h,
-            None,
-            &Cancel::default(),
-            Duration::from_secs(5),
-        );
+        let _ = out
+            .call("DELETE", "/mcp".into(), &h, None, &Cancel::default(), Duration::from_secs(5))
+            .await;
     }
 }
 
@@ -570,7 +611,7 @@ mod tests {
     /// Runs a turn against one stub that plays both the model and the station.
     fn run_turn(port: u16, provider: Provider, history: Vec<Msg>) -> Vec<Event> {
         let ctx = egui::Context::default();
-        let w = Worker::spawn(&ctx, Server::local(port), cfg(port, provider), Job::Turn { history });
+        let mut w = Worker::spawn(&ctx, Server::local(port), cfg(port, provider), Job::Turn { history });
         let mut events = Vec::new();
         let t = std::time::Instant::now();
         loop {
@@ -772,7 +813,7 @@ mod tests {
             _ => (404, "{}".into(), vec![]),
         });
         let ctx = egui::Context::default();
-        let w = Worker::spawn(
+        let mut w = Worker::spawn(
             &ctx,
             Server::local(port),
             cfg(port, Provider::OpenAi),
