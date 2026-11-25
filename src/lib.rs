@@ -74,7 +74,7 @@ impl Plugin for AiChat {
             icon: "bot",
             description:
                 "Chat with a language model of your choice, local or hosted, that can use the station through MCP",
-            version: "1.0.0",
+            version: "1.1.0",
             order: 20,
             can_tab: true,
         }

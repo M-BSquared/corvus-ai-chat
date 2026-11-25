@@ -28,4 +28,4 @@ loadable = true
 name = "AI Chat"
 description = "Chat with a language model of your choice, local or hosted, that can use the station through MCP"
 icon = "bot"
-version = "1.0.0"
+version = "1.1.0"

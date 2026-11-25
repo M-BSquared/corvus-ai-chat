@@ -31,7 +31,7 @@ const ROUND: u8 = 16;
 const SHOWN_CHARS: usize = 30_000;
 /// The bar grows with what is written, up to this many lines.
 const ROWS: usize = 6;
-const SEND: f32 = 34.0;
+const SEND: f32 = 26.0;
 
 /// What an empty chat offers to ask.
 const QUESTIONS: [(&str, &str); 4] = [
@@ -598,7 +598,7 @@ fn bar_lines(p: &AiChat, ui: &egui::Ui, w: f32) -> (f32, f32) {
         &p.input,
         style::font(TEXT, Weight::W400),
         style::text_1(),
-        w - SEND - 40.0,
+        w - SEND - 30.0,
         0,
     );
     let row = TEXT * 1.5;
@@ -607,13 +607,13 @@ fn bar_lines(p: &AiChat, ui: &egui::Ui, w: f32) -> (f32, f32) {
 }
 
 fn bar_height(p: &AiChat, ui: &egui::Ui, w: f32) -> f32 {
-    (bar_lines(p, ui, w).1 + 22.0).max(style::target(SEND) + 10.0)
+    (bar_lines(p, ui, w).1 + 14.0).max(style::target(SEND) + 8.0)
 }
 
 fn composer(p: &mut AiChat, ui: &mut egui::Ui, rect: Rect, h: &mut Host, ready: bool) {
     let id = ui.scope_id().with("ai-chat-input");
     let focused = ui.memory(|m| m.has_focus(id));
-    let round = 22;
+    let round = 17;
     let painter = ui.painter().clone();
     painter.rect_filled(rect, round, style::surface_1());
     painter.rect_filled(rect, round, style::input(0.6));
@@ -631,8 +631,8 @@ fn composer(p: &mut AiChat, ui: &mut egui::Ui, rect: Rect, h: &mut Host, ready: 
     let size = style::target(SEND);
     let (full, shown) = bar_lines(p, ui, rect.width());
     let field = Rect::from_min_max(
-        Pos2::new(rect.left() + 18.0, rect.center().y - shown / 2.0),
-        Pos2::new(rect.right() - size - 14.0, rect.center().y + shown / 2.0),
+        Pos2::new(rect.left() + 16.0, rect.center().y - shown / 2.0),
+        Pos2::new(rect.right() - size - 10.0, rect.center().y + shown / 2.0),
     );
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));
     child.set_clip_rect(field.expand(1.0).intersect(ui.clip_rect()));
@@ -673,7 +673,7 @@ fn composer(p: &mut AiChat, ui: &mut egui::Ui, rect: Rect, h: &mut Host, ready: 
         .inner;
     let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
 
-    let center = Pos2::new(rect.right() - 6.0 - size / 2.0, rect.bottom() - 6.0 - size / 2.0);
+    let center = Pos2::new(rect.right() - 4.0 - size / 2.0, rect.bottom() - 4.0 - size / 2.0);
     let button = Rect::from_center_size(center, Vec2::splat(size));
     let able = p.busy || (ready && !p.input.trim().is_empty());
     let (icon, tip) = if p.busy { ("square", "Stop") } else { ("send", "Send") };
@@ -689,7 +689,7 @@ fn composer(p: &mut AiChat, ui: &mut egui::Ui, rect: Rect, h: &mut Host, ready: 
     icons::paint(
         ui,
         icon,
-        Rect::from_center_size(center, Vec2::splat(if p.busy { 13.0 } else { 15.0 })),
+        Rect::from_center_size(center, Vec2::splat(if p.busy { 11.0 } else { 13.0 })),
         style::text_inverted(),
     );
     if press.clicked() && p.busy {

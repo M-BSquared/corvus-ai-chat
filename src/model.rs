@@ -190,6 +190,8 @@ pub struct Tool {
     pub name: String,
     /// What the MCP server calls it.
     pub mcp_name: String,
+    /// A plugin of the station offers it.
+    pub plugin: bool,
     pub description: String,
     pub schema: Value,
 }
@@ -239,6 +241,7 @@ pub fn tools_from_mcp(list: &Value) -> Vec<Tool> {
         out.push(Tool {
             name,
             mcp_name: mcp_name.to_string(),
+            plugin: t.get("description").and_then(Value::as_str).is_some_and(is_plugins),
             description: t.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
             schema,
         });
@@ -246,20 +249,38 @@ pub fn tools_from_mcp(list: &Value) -> Vec<Tool> {
     out
 }
 
-/// The tools a small model is offered: reading, drawing and plain flying. The whole
-/// list takes about eleven thousand tokens, more than many local models are run with.
-const FEW: [&str; 24] = [
-    "get_vehicle_state",
-    "get_capabilities",
+/// Whether a tool is a plugin's: the station says so at the end of its description.
+fn is_plugins(description: &str) -> bool {
+    description.ends_with(')') && description.contains("(plugin ")
+}
+
+/// How many tools of plugins a small model is offered besides.
+const FEW_OF_PLUGINS: usize = 12;
+
+/// The tools a small model is offered: reading, drawing, planning and plain flying. The whole
+/// list takes well over ten thousand tokens, more than many local models are run with.
+const FEW: [&str; 34] = [
+    "get_telemetry",
     "list_flight_modes",
-    "download_mission",
     "get_parameters",
     "wait_for",
     "measure",
-    "draw_on_map",
+    "draw_marker",
+    "draw_line",
+    "draw_circle",
+    "draw_area",
     "list_drawings",
     "remove_drawings",
     "show_on_map",
+    "search_place",
+    "open_page",
+    "get_mission_plan",
+    "plan_mission",
+    "plan_survey",
+    "edit_mission_item",
+    "remove_mission_item",
+    "open_mission_plan",
+    "upload_mission_plan",
     "arm",
     "disarm",
     "takeoff",
@@ -300,9 +321,17 @@ impl Offer {
         if self == Offer::All || !tools.iter().any(|t| FEW.contains(&t.mcp_name.as_str())) {
             return tools;
         }
+        // The operator switched a plugin's tools on in its gear, so they are wanted.
+        let mut left = FEW_OF_PLUGINS;
         tools
             .into_iter()
-            .filter(|t| FEW.contains(&t.mcp_name.as_str()))
+            .filter(|t| {
+                FEW.contains(&t.mcp_name.as_str())
+                    || (t.plugin && left > 0 && {
+                        left -= 1;
+                        true
+                    })
+            })
             .collect()
     }
 }
@@ -672,11 +701,21 @@ mod tests {
             let list: Vec<Value> = names.iter().map(|n| json!({"name": n})).collect();
             tools_from_mcp(&json!({ "tools": list }))
         };
-        let short = Offer::Few.of(tools(&["hold", "tak_status", "draw_on_map"]));
+        let short = Offer::Few.of(tools(&["hold", "tak_status", "draw_line"]));
         let names: Vec<&str> = short.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["hold", "draw_on_map"]);
+        assert_eq!(names, ["hold", "draw_line"]);
         assert_eq!(Offer::All.of(tools(&["hold", "tak_status"])).len(), 2);
         assert_eq!(Offer::Few.of(tools(&["other"])).len(), 1, "never nothing at all");
+        let of_plugins: Vec<Value> = (0..40)
+            .map(|i| json!({"name": format!("map-entities_{i}"), "description": "Place it. (plugin Map Entities)"}))
+            .chain([
+                json!({"name": "hold", "description": "d"}),
+                json!({"name": "other", "description": "(x)"}),
+            ])
+            .collect();
+        let short = Offer::Few.of(tools_from_mcp(&json!({ "tools": of_plugins })));
+        assert_eq!(short.iter().filter(|t| t.plugin).count(), FEW_OF_PLUGINS);
+        assert_eq!(short.len(), FEW_OF_PLUGINS + 1, "and not what is neither");
     }
 
     fn ep(t: &str) -> Endpoint {
@@ -798,6 +837,7 @@ mod tests {
         Tool {
             name: "get_telemetry".into(),
             mcp_name: "get_telemetry".into(),
+            plugin: false,
             description: "Read".into(),
             schema: json!({"type": "object"}),
         }
